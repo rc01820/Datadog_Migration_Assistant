@@ -1,0 +1,14 @@
+services:
+  migration-assistant:
+    build: .
+    image: datadog-migration-assistant:1.0.0
+    container_name: datadog-migration-assistant
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file: .env
+    volumes:
+      - dma-data:/data
+
+volumes:
+  dma-data:
