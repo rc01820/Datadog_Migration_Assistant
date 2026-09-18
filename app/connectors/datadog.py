@@ -75,10 +75,12 @@ class DatadogClient:
 
     # ------------------------------------------------------------ inventory
     def collect(self, progress: Callable[[int, str], None]) -> tuple[dict, list[str]]:
-        inv = {"hosts": [], "ndm_devices": [], "monitors": [], "dashboards": [], "tags": {}, "services": []}
+        inv = {"hosts": [], "ndm_devices": [], "monitors": [], "dashboards": [], "tags": {}, "services": [],
+               "synthetics": []}
         warnings = []
         steps = [("hosts", self._hosts), ("tags", self._tags), ("monitors", self._monitors),
-                 ("dashboards", self._dashboards), ("ndm_devices", self._ndm), ("services", self._services)]
+                 ("dashboards", self._dashboards), ("ndm_devices", self._ndm), ("services", self._services),
+                 ("synthetics", self._synthetics)]
         for i, (name, fn) in enumerate(steps):
             progress(int(58 + i * 30 / len(steps)), f"Reading Datadog {name.replace('_', ' ')}")
             try:
@@ -140,6 +142,24 @@ class DatadogClient:
             except DatadogError:
                 continue
         return out
+
+    def _synthetics(self):
+        """Synthetic API HTTP tests and browser tests, with their target URL."""
+        out, page = [], 0
+        while True:
+            body = self._get("/api/v1/synthetics/tests", {"page_size": 100, "page_number": page}, allow_404=True)
+            rows = body.get("tests", [])
+            for t in rows:
+                ttype, sub = t.get("type"), t.get("subtype")
+                if not (ttype == "browser" or (ttype == "api" and sub in (None, "http"))):
+                    continue
+                req = (t.get("config") or {}).get("request") or {}
+                out.append({"id": t.get("public_id"), "name": t.get("name") or "",
+                            "type": "browser" if ttype == "browser" else "http",
+                            "url": req.get("url") or "", "tags": t.get("tags") or []})
+            if len(rows) < 100:
+                return out
+            page += 1
 
     def _services(self):
         out, page = [], 0

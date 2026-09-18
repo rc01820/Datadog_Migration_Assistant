@@ -4,16 +4,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import threading
 import traceback
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import crypto, db, demo, reports
+from . import auth, crypto, db, demo, reports
 from .connectors.datadog import SITES, DatadogClient, DatadogError
 from .connectors.solarwinds import SolarWindsClient, SolarWindsError
 from .mapping import engine
@@ -26,6 +27,8 @@ STATIC = Path(__file__).parent / "static"
 
 app = FastAPI(title="Datadog Migration Assistant", version="1.0.0")
 db.init()
+auth.bootstrap_from_env()
+auth.purge_expired()
 # A scan thread cannot survive a restart; release any scan left "running".
 db.execute("UPDATE scans SET status='failed', message='Interrupted by an application restart', "
            "finished_at=? WHERE status='running'", (db.now(),))
@@ -39,6 +42,151 @@ TOOLS = [
     {"id": "nagiosxi", "name": "Nagios XI", "available": False, "detail": "Planned"},
     {"id": "prtg", "name": "PRTG", "available": False, "detail": "Planned"},
 ]
+
+
+# --------------------------------------------------------------------- auth
+PUBLIC_PATHS = {"/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/setup"}
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")
+
+
+def _is_https(request: Request) -> bool:
+    return (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+
+
+def _set_session_cookies(response: Response, session: dict, request: Request) -> None:
+    secure, max_age = _is_https(request), auth.SESSION_HOURS * 3600
+    response.set_cookie(auth.COOKIE_SESSION, session["token"], max_age=max_age, httponly=True,
+                        samesite="lax", secure=secure, path="/")
+    # Readable by JavaScript on purpose: double-submit CSRF token.
+    response.set_cookie(auth.COOKIE_CSRF, session["csrf"], max_age=max_age, httponly=False,
+                        samesite="lax", secure=secure, path="/")
+
+
+def _clear_session_cookies(response: Response) -> None:
+    response.delete_cookie(auth.COOKIE_SESSION, path="/")
+    response.delete_cookie(auth.COOKIE_CSRF, path="/")
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/") or path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    bearer = ""
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        bearer = header[7:].strip()
+    cookie = request.cookies.get(auth.COOKIE_SESSION, "")
+    user = auth.session_user(bearer or cookie)
+    if not user:
+        return JSONResponse({"detail": "Sign in to continue"}, status_code=401)
+
+    # CSRF: cookie-authenticated writes must echo the CSRF cookie in a header.
+    if not bearer and request.method not in ("GET", "HEAD", "OPTIONS"):
+        sent = request.headers.get("x-csrf-token", "")
+        expected = request.cookies.get(auth.COOKIE_CSRF, "")
+        if not sent or not expected or not secrets.compare_digest(sent, expected):
+            return JSONResponse({"detail": "Invalid CSRF token. Reload the page and try again."}, status_code=403)
+
+    request.state.user = user
+    return await call_next(request)
+
+
+class Credentials(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    if not auth.user_count():
+        return {"authenticated": False, "setup_required": True}
+    user = auth.session_user(request.cookies.get(auth.COOKIE_SESSION, ""))
+    return {"authenticated": bool(user), "setup_required": False,
+            "username": user["username"] if user else None}
+
+
+@app.post("/api/auth/setup")
+def auth_setup(body: Credentials, request: Request):
+    if auth.user_count():
+        raise HTTPException(409, "An account already exists. Sign in instead.")
+    try:
+        user = auth.create_user(body.username, body.password)
+        session = auth.create_session(user["id"], user["username"])
+    except auth.AuthError as e:
+        raise HTTPException(400, str(e)) from e
+    response = JSONResponse({"username": session["username"], "expires_at": session["expires_at"]})
+    _set_session_cookies(response, session, request)
+    return response
+
+
+@app.post("/api/auth/login")
+def auth_login(body: Credentials, request: Request):
+    try:
+        session = auth.login(body.username, body.password, _client_ip(request))
+    except auth.AuthError as e:
+        log.info("failed sign-in for %r from %s", body.username, _client_ip(request))
+        raise HTTPException(401, str(e)) from e
+    response = JSONResponse({"username": session["username"], "expires_at": session["expires_at"],
+                             "token": session["token"]})
+    _set_session_cookies(response, session, request)
+    return response
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    auth.logout(request.cookies.get(auth.COOKIE_SESSION, ""))
+    response = JSONResponse({"signed_out": True})
+    _clear_session_cookies(response)
+    return response
+
+
+@app.post("/api/auth/password")
+def auth_change_password(body: PasswordChange, request: Request):
+    user = auth.get_user(request.state.user["username"])
+    if not auth.verify_password(body.current_password, user["password_hash"]):
+        raise HTTPException(400, "Current password is incorrect")
+    try:
+        auth.set_password(user["id"], body.new_password)
+    except auth.AuthError as e:
+        raise HTTPException(400, str(e)) from e
+    response = JSONResponse({"changed": True})
+    _clear_session_cookies(response)   # other sessions are revoked; sign in again
+    return response
+
+
+@app.get("/api/users")
+def users_list():
+    return auth.list_users()
+
+
+@app.post("/api/users")
+def users_create(body: Credentials):
+    try:
+        return auth.create_user(body.username, body.password)
+    except auth.AuthError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.delete("/api/users/{uid}")
+def users_delete(uid: int, request: Request):
+    if uid == request.state.user["id"]:
+        raise HTTPException(400, "You cannot delete the account you are signed in with")
+    try:
+        auth.delete_user(uid)
+    except auth.AuthError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"deleted": uid}
 
 
 # ------------------------------------------------------------------- models

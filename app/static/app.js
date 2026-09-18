@@ -4,18 +4,30 @@
 const $ = (s, el = document) => el.querySelector(s);
 const main = $("#main");
 const sidebar = $("#sidebar");
-const state = { meta: null, project: null, scans: [], poll: null };
+const state = { meta: null, project: null, scans: [], poll: null, auth: null };
 
 const h = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (n) => Number(n ?? 0).toLocaleString();
 const when = (iso) => (iso ? new Date(iso).toLocaleString() : "");
 
+const cookie = (name) => document.cookie.split("; ").find((c) => c.startsWith(name + "="))?.split("=")[1] || "";
+
 async function api(path, opts = {}) {
+  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  if (opts.method && opts.method !== "GET") headers["X-CSRF-Token"] = decodeURIComponent(cookie("dma_csrf"));
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" }, ...opts,
+    credentials: "same-origin", ...opts, headers,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && !path.startsWith("/api/auth/")) {
+    state.auth = { authenticated: false };
+    const err = new Error("Your session has expired. Sign in again.");
+    err.unauthorized = true;
+    renderAuthChrome();
+    viewLogin(err.message);
+    throw err;
+  }
   if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${res.status})`);
   return data;
 }
@@ -38,9 +50,14 @@ function stopPoll() { clearTimeout(state.poll); state.poll = null; }
 async function route() {
   stopPoll();
   sidebar.classList.remove("open");
+  state.auth = await api("/api/auth/status");
+  renderAuthChrome();
+  if (state.auth.setup_required) return viewSetup();
+  if (!state.auth.authenticated) return viewLogin();
   if (!state.meta) state.meta = await api("/api/meta");
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   try {
+    if (parts[0] === "account") return await viewAccount();
     if (parts[0] === "new") return await viewConnect(parts[1] || "solarwinds");
     if (parts[0] === "p" && parts[1]) {
       await loadProject(Number(parts[1]));
@@ -91,6 +108,152 @@ function renderSidebar(view, sub) {
 }
 
 function hideSidebar() { sidebar.hidden = true; $("#menuBtn").hidden = true; }
+
+/* --------------------------------------------------------------- auth views */
+function renderAuthChrome() {
+  const chip = $("#userChip");
+  if (!state.auth?.authenticated) {
+    chip.hidden = true;
+    chip.innerHTML = "";
+    hideSidebar();
+    $("#crumbs").innerHTML = "";
+    return;
+  }
+  chip.hidden = false;
+  chip.innerHTML = `<a href="#/account">${h(state.auth.username)}</a><button id="signOut">Sign out</button>`;
+  $("#signOut").addEventListener("click", async () => {
+    await api("/api/auth/logout", { method: "POST" }).catch(() => {});
+    state.auth = { authenticated: false };
+    state.project = null;
+    location.hash = "#/";
+    route();
+  });
+}
+
+function authShell(title, intro, fields, button, note = "") {
+  hideSidebar();
+  main.innerHTML = `
+  <div class="auth-page">
+    <form class="panel auth-card" id="authForm">
+      <svg class="auth-mark" viewBox="0 0 40 20" aria-hidden="true"><circle cx="6" cy="10" r="5"/><path d="M11 10h14"/><circle cx="32" cy="10" r="5" class="ring"/></svg>
+      <h1>${h(title)}</h1>
+      <p class="muted">${intro}</p>
+      ${fields}
+      <div class="test-result fail" id="authError" role="alert"></div>
+      <button class="primary" type="submit" id="authSubmit">${h(button)}</button>
+      ${note ? `<p class="small muted">${note}</p>` : ""}
+    </form>
+  </div>`;
+}
+
+function viewLogin(message = "") {
+  authShell("Datadog Migration Assistant", "Sign in to continue.",
+    `<label class="field">Username<input id="u" autocomplete="username" autofocus required></label>
+     <label class="field">Password<input id="p" type="password" autocomplete="current-password" required></label>`,
+    "Sign in");
+  if (message) $("#authError").textContent = message;
+  $("#authForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = $("#authSubmit");
+    btn.disabled = true;
+    $("#authError").textContent = "";
+    try {
+      const r = await api("/api/auth/login", { method: "POST", body: { username: $("#u").value, password: $("#p").value } });
+      state.auth = { authenticated: true, username: r.username };
+      state.meta = null;
+      renderAuthChrome();
+      route();
+    } catch (err) {
+      $("#authError").textContent = err.message;
+      btn.disabled = false;
+      $("#p").value = "";
+      $("#p").focus();
+    }
+  });
+}
+
+function viewSetup() {
+  authShell("Create the first account", "No accounts exist yet. Choose the credentials you will sign in with.",
+    `<label class="field">Username<input id="u" autocomplete="username" autofocus required></label>
+     <label class="field">Password<input id="p" type="password" autocomplete="new-password" required></label>
+     <label class="field">Repeat password<input id="p2" type="password" autocomplete="new-password" required></label>`,
+    "Create account", "At least 10 characters. Store it in your password manager: there is no reset link.");
+  $("#authForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("#authError").textContent = "";
+    if ($("#p").value !== $("#p2").value) return ($("#authError").textContent = "The passwords do not match.");
+    const btn = $("#authSubmit");
+    btn.disabled = true;
+    try {
+      const r = await api("/api/auth/setup", { method: "POST", body: { username: $("#u").value, password: $("#p").value } });
+      state.auth = { authenticated: true, username: r.username };
+      renderAuthChrome();
+      route();
+    } catch (err) {
+      $("#authError").textContent = err.message;
+      btn.disabled = false;
+    }
+  });
+}
+
+async function viewAccount() {
+  hideSidebar();
+  crumbs([{ label: "Migrations", href: "#/" }, { label: "Account" }]);
+  const users = await api("/api/users");
+  main.innerHTML = `
+  <div class="page stack" style="max-width:720px">
+    <div><h1>Account</h1><p class="muted" style="margin-top:6px">Signed in as ${h(state.auth.username)}.</p></div>
+    <section class="panel">
+      <div class="panel-head"><h2>Change password</h2></div>
+      <div class="panel-body stack">
+        <label class="field">Current password<input id="cur" type="password" autocomplete="current-password"></label>
+        <label class="field">New password<input id="new1" type="password" autocomplete="new-password"></label>
+        <label class="field">Repeat new password<input id="new2" type="password" autocomplete="new-password"></label>
+        <div class="row"><button class="primary" id="chg">Change password</button>
+          <span class="small muted">All sessions are signed out afterwards.</span></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>People with access</h2></div>
+      <div class="table-wrap"><table><thead><tr><th>Username</th><th>Created</th><th>Last sign-in</th><th></th></tr></thead><tbody>
+        ${users.map((u) => `<tr><td class="name">${h(u.username)}</td><td>${when(u.created_at)}</td>
+          <td>${u.last_login ? when(u.last_login) : "never"}</td>
+          <td class="num">${u.username === state.auth.username ? "" : `<button class="danger" data-del="${u.id}" style="padding:3px 10px">Remove</button>`}</td></tr>`).join("")}
+      </tbody></table></div>
+      <div class="panel-body row" style="border-top:1px solid var(--line)">
+        <input id="nu" placeholder="New username" style="max-width:200px">
+        <input id="np" type="password" placeholder="Password" autocomplete="new-password" style="max-width:200px">
+        <button id="addUser">Add account</button>
+      </div>
+    </section>
+  </div>`;
+  $("#chg").addEventListener("click", async (e) => {
+    if ($("#new1").value !== $("#new2").value) return toast("The new passwords do not match.", true);
+    e.currentTarget.disabled = true;
+    try {
+      await api("/api/auth/password", { method: "POST", body: { current_password: $("#cur").value, new_password: $("#new1").value } });
+      state.auth = { authenticated: false };
+      renderAuthChrome();
+      viewLogin("Password changed. Sign in again.");
+    } catch (err) { toast(err.message, true); e.currentTarget.disabled = false; }
+  });
+  $("#addUser").addEventListener("click", async (e) => {
+    e.currentTarget.disabled = true;
+    try {
+      await api("/api/users", { method: "POST", body: { username: $("#nu").value, password: $("#np").value } });
+      toast("Account added.");
+      viewAccount();
+    } catch (err) { toast(err.message, true); e.currentTarget.disabled = false; }
+  });
+  main.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("Remove this account?")) return;
+    try {
+      await api(`/api/users/${b.dataset.del}`, { method: "DELETE" });
+      toast("Account removed.");
+      viewAccount();
+    } catch (err) { toast(err.message, true); }
+  }));
+}
 
 /* -------------------------------------------------------------------- home */
 async function viewHome() {
@@ -345,7 +508,7 @@ async function viewOverview() {
           <div class="kpi unsupported"><b>${fmt(o.unsupported)}</b><span>Unsupported</span></div>
         </div>
         <div class="panel-body small muted" style="border-top:1px solid var(--line)">
-          Datadog today: ${fmt(o.datadog?.hosts)} hosts, ${fmt(o.datadog?.ndm_devices)} network devices, ${fmt(o.datadog?.monitors)} monitors, ${fmt(o.datadog?.dashboards)} dashboards.
+          Datadog today: ${fmt(o.datadog?.hosts)} hosts, ${fmt(o.datadog?.ndm_devices)} network devices, ${fmt(o.datadog?.monitors)} monitors, ${fmt(o.datadog?.synthetics)} synthetic tests, ${fmt(o.datadog?.dashboards)} dashboards.
         </div>
       </section>
     </div>

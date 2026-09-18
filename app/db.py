@@ -38,6 +38,17 @@ def init() -> None:
                 started_at TEXT, finished_at TEXT,
                 summary TEXT, results TEXT, warnings TEXT);
             CREATE INDEX IF NOT EXISTS ix_scans_project ON scans(project_id, id);
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT, last_login TEXT);
+            CREATE TABLE IF NOT EXISTS sessions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT, expires_at TEXT);
+            CREATE INDEX IF NOT EXISTS ix_sessions_token ON sessions(token_hash);
             """
         )
 

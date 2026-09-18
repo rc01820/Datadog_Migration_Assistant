@@ -92,6 +92,27 @@ def build(scan_number: int):
     nodes.append({"id": nid, "name": "saas-status-page", "ip": "203.0.113.10", "dns": "", "sysname": "",
                   "vendor": "", "machine_type": "", "polling_method": "External", "status": "Up",
                   "snmp_version": 0, "sys_object_id": "", "unmanaged": False})
+    http_apps = [(f"{site}-web-01", "HTTPS Monitor", f"Portal {site.upper()}", f"https://{site}-portal.example.com/health")
+                 for site in SITES]
+    http_apps += [("saas-status-page", "HTTP Monitor", "Status page", "http://status.example.com/"),
+                  ("saas-status-page", "HTTPS Monitor", "Public API ping", "https://api.example.com/v1/ping"),
+                  ("saas-status-page", "HTTPS Monitor", "Customer login", "https://login.example.com/")]
+    by_caption = {n["name"]: n for n in nodes}
+    proc_apps = [(f"{site}-{role}-01", proc) for site in SITES
+                 for role, proc in (("app", "java"), ("web", "w3wp.exe"), ("mq", "beam.smp"))]
+    for node_name, proc in proc_apps:
+        aid += 1
+        node = by_caption[node_name]
+        apps.append({"id": aid, "name": f"{proc} process", "node_id": node["id"], "node_name": node_name,
+                     "template": "Windows Process Monitor" if proc.endswith(".exe") else "Linux Process Monitor",
+                     "components": [{"id": aid * 10, "name": "Process Monitor", "type": 0, "process": proc}]})
+    for node_name, template, app_name, url in http_apps:
+        aid += 1
+        node = by_caption[node_name]
+        apps.append({"id": aid, "name": app_name, "node_id": node["id"], "node_name": node_name,
+                     "template": template, "components": [
+                         {"id": aid * 10, "name": "HTTPS Monitor" if url.startswith("https") else "HTTP Monitor",
+                          "type": 0, "url": url}]})
 
     groups = []
     for gi, (gname, dyn, members) in enumerate([
@@ -173,6 +194,25 @@ def build(scan_number: int):
     monitors = [{"id": 1000 + a["id"], "name": a["name"], "type": "metric alert", "query": "",
                  "tags": [f"sw_alert_id:{a['id']}"]} for a in alerts if migrated(f"m{a['id']}")]
     monitors.append({"id": 999, "name": "Datadog Agent heartbeat", "type": "service check", "query": "", "tags": []})
+    for a in apps:
+        proc = next((c.get("process") for c in a["components"] if c.get("process")), None)
+        if proc and migrated(f"p{a['id']}"):
+            monitors.append({"id": 4000 + a["id"], "name": f"{proc} running on {a['node_name']}",
+                             "type": "process alert",
+                             "query": f'processes("{proc}").over("host:{a["node_name"]}").rollup("count").last(5m) < 1',
+                             "tags": []})
+    synthetics = []
+    for a in apps:
+        url = next((c.get("url") for c in a["components"] if c.get("url")), None)
+        if not url or not migrated(f"s{a['id']}"):
+            continue
+        if a["id"] % 2:
+            synthetics.append({"id": f"abc-{a['id']:03d}-xyz", "name": f"{a['name']} availability",
+                               "type": "http", "url": url.rstrip("/") + "/", "tags": []})
+        else:
+            monitors.append({"id": 3000 + a["id"], "name": f"{a['name']} http check", "type": "service check",
+                             "query": f'"http.can_connect".over("instance:{a["name"]}","url:{url}")'
+                                      '.by("host").last(3).count_by_status()', "tags": []})
     dashboards = [{"id": "abc-123", "title": "Core Network Overview"}]
     if frac > 0.5:
         dashboards.append({"id": "def-456", "title": "Payments Service Health"})
@@ -181,5 +221,5 @@ def build(scan_number: int):
         services = [{"name": "bos-web-01", "depends_on": ["bos-core-sw-01"]},
                     {"name": "bos-app-01", "depends_on": ["bos-core-sw-01"]}]
     dd = {"hosts": hosts, "ndm_devices": ndm, "monitors": monitors, "dashboards": dashboards,
-          "tags": tags, "services": services}
+          "tags": tags, "services": services, "synthetics": synthetics}
     return sw, dd

@@ -1,5 +1,7 @@
 """SolarWinds -> Datadog mapping rules. These drive both the engine and the
 Mapping Rules page, so the documentation can never drift from behaviour."""
+import os
+
 
 CATEGORY_META = {
     "nodes": {"label": "Nodes", "source": "Node", "target": "Host / Device"},
@@ -48,10 +50,14 @@ RULES = [
         {"when": "Migrated when", "result": "match", "action": "A Datadog host tag with the normalized key exists."},
     ]},
     {"category": "applications", "source": "SAM Monitor", "target": "Integration / Check", "rules": [
-        {"when": "Template matches a known technology (IIS, SQL Server, Apache, HTTP, TCP port, Windows service, process and more)", "result": "auto", "action": "Enable the matching Datadog integration on the host."},
+        {"when": "HTTP or HTTPS monitor: the template or application name says HTTP/HTTPS/URL/web, or (when the name matches no other technology) any component has an http(s):// URL, an HTTP/HTTPS name, or a configured HTTP component type", "result": "auto", "action": "Create a Synthetic HTTP test or an http_check monitor for the URL. No Datadog host is required."},
+        {"when": "HTTP(S) monitor: the monitored URL matches a Synthetic HTTP/browser test or an http_check monitor in Datadog", "result": "match", "action": "Counted as migrated. Match quality is recorded: exact URL, same hostname, or similar name."},
+        {"when": "Process monitor: a component watches a process (Windows, Linux or Unix process monitor, a ProcessName setting, or a configured process component type)", "result": "auto", "action": "Monitor with the Agent process check (process.d / Live Processes) and alert with a process monitor. Runs on the host."},
+        {"when": "Process monitor: the process name matches a Datadog process monitor, or the host runs the process check", "result": "match", "action": "Counted as migrated. Match quality is recorded: process name, host process check, or similar name."},
+        {"when": "Template matches another known technology (IIS, SQL Server, Apache, TCP port, Windows service and more)", "result": "auto", "action": "Enable the matching Datadog integration on the host."},
         {"when": "Script, PowerShell, WMI or custom template", "result": "review", "action": "Rebuild as a custom Agent check or DogStatsD metric."},
         {"when": "Template has no Datadog equivalent", "result": "unsupported", "action": "Document and decide whether to retire it."},
-        {"when": "Migrated when", "result": "match", "action": "The host reports the integration in its Datadog app list."},
+        {"when": "Migrated when", "result": "match", "action": "HTTP(S) templates: a Synthetic HTTP test or http_check monitor targets the same URL (else the same hostname, else a similar name); no node or host is needed. Other templates: the host reports the integration in its Datadog app list."},
     ]},
     {"category": "alerts", "source": "Alert", "target": "Monitor", "rules": [
         {"when": "Enabled alert on Node, Interface or Volume", "result": "auto", "action": "Create a metric or service-check monitor with equivalent thresholds."},
@@ -65,8 +71,9 @@ RULES = [
         {"when": "Migrated when", "result": "match", "action": "A service definition for the child lists the parent in dependsOn."},
     ]},
     {"category": "snmp_devices", "source": "SNMP device", "target": "NDM Device", "rules": [
-        {"when": "SNMP v1, v2c or v3", "result": "auto", "action": "Add to NDM with a matching profile (sysObjectID)."},
-        {"when": "No sysObjectID recorded", "result": "review", "action": "Confirm a Datadog SNMP profile exists for the device."},
+        {"when": "Node is a Windows or Linux server", "result": "unsupported", "action": "Not mapped to NDM. The server is migrated as an Agent host (see Nodes)."},
+        {"when": "SNMP v1, v2c or v3, sysObjectID recorded, and not a Windows or Linux server", "result": "auto", "action": "Add to NDM with a matching profile (sysObjectID)."},
+        {"when": "Not a Windows or Linux server, but no sysObjectID or no recognized SNMP version", "result": "review", "action": "Confirm the SNMP version and that a Datadog SNMP profile exists for the device."},
         {"when": "Migrated when", "result": "match", "action": "An NDM device with the same IP or name exists."},
     ]},
 ]
@@ -99,10 +106,26 @@ SAM_INTEGRATIONS = [
     (("ldap",), "openldap"),
     (("smtp", "pop3", "imap"), "tcp_check"),
 ]
+# A node is treated as a Windows server when its sysObjectID is under the Microsoft
+# Windows OID, or its vendor / machine type / OS version mentions Windows.
+WINDOWS_SYS_OBJECT_ID = "1.3.6.1.4.1.311.1.1.3"
+WINDOWS_KEYWORDS = ("windows",)
+
 # A node is treated as a Linux server when its sysObjectID is the net-snmp Linux
 # agent OID, or its vendor / machine type / OS version contains one of these.
 LINUX_SYS_OBJECT_ID = "1.3.6.1.4.1.8072.3.2.10"
 LINUX_KEYWORDS = ("linux", "red hat", "rhel", "centos", "rocky", "almalinux", "ubuntu",
                   "debian", "suse", "sles", "oracle linux", "amazon linux", "fedora")
+
+# SAM component type IDs that are HTTP/HTTPS monitors in your Orion (optional).
+# Type IDs vary by SAM version; confirm them with SWQL before setting, e.g.
+#   DMA_SAM_HTTP_COMPONENT_TYPES=6,14
+SAM_HTTP_COMPONENT_TYPES = {
+    int(x) for x in os.getenv("DMA_SAM_HTTP_COMPONENT_TYPES", "").replace(" ", "").split(",") if x.isdigit()
+}
+# SAM component type IDs that are process monitors, e.g. DMA_SAM_PROCESS_COMPONENT_TYPES=9,10
+SAM_PROCESS_COMPONENT_TYPES = {
+    int(x) for x in os.getenv("DMA_SAM_PROCESS_COMPONENT_TYPES", "").replace(" ", "").split(",") if x.isdigit()
+}
 
 SAM_REVIEW_KEYWORDS = ("script", "powershell", "wmi", "performance counter", "custom", "snmp", "file", "event log", "odbc")

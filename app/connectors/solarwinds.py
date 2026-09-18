@@ -46,6 +46,14 @@ FROM Orion.APM.Application a
 LEFT JOIN Orion.APM.ApplicationTemplate t ON a.ApplicationTemplateID = t.ApplicationTemplateID
 """
 Q_COMPONENTS = "SELECT c.ComponentID, c.Name, c.ApplicationID, c.ComponentType FROM Orion.APM.Component c"
+# `Key` is reserved in SWQL and must be bracket-escaped. Variants are tried in order.
+# `Key` is reserved in SWQL and must be bracket-escaped. Variants are tried in order.
+SETTING_KEYS = ("Url", "ProcessName", "ProcessCommandLine", "ProcessNameFilter")
+_KEY_LIST = ", ".join(f"'{k}'" for k in SETTING_KEYS)
+Q_COMPONENT_SETTINGS = [
+    f"SELECT s.ComponentID, s.[Key] AS SettingKey, s.Value FROM Orion.APM.ComponentSetting s WHERE s.[Key] IN ({_KEY_LIST})",
+    f"SELECT ComponentID, [Key] AS SettingKey, Value FROM Orion.APM.ComponentSetting WHERE [Key] IN ({_KEY_LIST})",
+]
 Q_ALERTS = """
 SELECT ac.AlertID, ac.Name, ac.Description, ac.Enabled, ac.Severity, ac.ObjectType, ac.Frequency
 FROM Orion.AlertConfigurations ac
@@ -106,6 +114,7 @@ class SolarWindsClient:
     def collect(self, progress: Callable[[int, str], None]) -> tuple[dict, list[str]]:
         inv: dict = {c: [] for c in CATEGORIES}
         warnings: list[str] = []
+        self._warnings = warnings
         steps = [
             ("nodes", self._nodes), ("interfaces", self._interfaces), ("volumes", self._volumes),
             ("groups", self._groups), ("custom_properties", self._custom_properties),
@@ -217,13 +226,37 @@ class SolarWindsClient:
             for c in self.query(Q_COMPONENTS):
                 comps[c["ApplicationID"]].append({"id": c["ComponentID"], "name": c.get("Name") or "",
                                                   "type": c.get("ComponentType")})
-        except SolarWindsError:
-            pass
+        except SolarWindsError as e:
+            self._warn(f"SAM components not read; HTTP(S) monitors can only be found by name: {e}")
+        settings, last_error = defaultdict(dict), None
+        for q in Q_COMPONENT_SETTINGS:
+            try:
+                for s in self.query(q):
+                    if s.get("Value"):
+                        settings[s["ComponentID"]][str(s.get("SettingKey") or "")] = str(s["Value"]).strip()
+                last_error = None
+                break
+            except SolarWindsError as e:
+                last_error = e
+        if last_error:
+            self._warn(f"SAM component settings not read (Orion.APM.ComponentSetting): {last_error}")
+        for items in comps.values():
+            for c in items:
+                found = settings.get(c["id"], {})
+                if found.get("Url"):
+                    c["url"] = found["Url"]
+                process = found.get("ProcessName") or found.get("ProcessNameFilter") or found.get("ProcessCommandLine")
+                if process:
+                    c["process"] = process
         return [{
             "id": r["ApplicationID"], "name": r.get("Name") or "", "node_id": r.get("NodeID"),
             "node_name": r.get("NodeName") or "", "template": r.get("TemplateName") or "",
             "components": comps[r["ApplicationID"]],
         } for r in self.query(Q_APPS)]
+
+    def _warn(self, message: str):
+        log.warning(message)
+        getattr(self, "_warnings", []).append(message)
 
     def _alerts(self, _inv):
         return [{

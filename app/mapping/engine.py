@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from urllib.parse import urlsplit
 from collections import defaultdict
 
-from .rules import (CATEGORY_META, LINUX_KEYWORDS, LINUX_SYS_OBJECT_ID, SAM_INTEGRATIONS,
-                    SAM_REVIEW_KEYWORDS)
+from .rules import (CATEGORY_META, LINUX_KEYWORDS, LINUX_SYS_OBJECT_ID, SAM_HTTP_COMPONENT_TYPES,
+                    SAM_INTEGRATIONS, SAM_PROCESS_COMPONENT_TYPES, SAM_REVIEW_KEYWORDS, WINDOWS_KEYWORDS,
+                    WINDOWS_SYS_OBJECT_ID)
 
 ORDER = list(CATEGORY_META)
 
@@ -32,14 +34,54 @@ def tag_key(value: str) -> str:
     return key if key[:1].isalpha() else f"sw_{key}"
 
 
+def _oid_under(node: dict, root: str) -> bool:
+    oid = str(node.get("sys_object_id") or "").lstrip(".")
+    return oid == root or oid.startswith(root + ".")
+
+
+def _node_text(node: dict) -> str:
+    return " ".join(str(node.get(k) or "") for k in ("vendor", "machine_type", "os_version")).lower()
+
+
+def is_windows_server(node: dict | None) -> bool:
+    if not node:
+        return False
+    return _oid_under(node, WINDOWS_SYS_OBJECT_ID) or any(k in _node_text(node) for k in WINDOWS_KEYWORDS)
+
+
 def is_linux_server(node: dict | None) -> bool:
     if not node:
         return False
-    oid = str(node.get("sys_object_id") or "").lstrip(".")
-    if oid == LINUX_SYS_OBJECT_ID or oid.startswith(LINUX_SYS_OBJECT_ID + "."):
-        return True
-    text = " ".join(str(node.get(k) or "") for k in ("vendor", "machine_type", "os_version")).lower()
-    return any(k in text for k in LINUX_KEYWORDS)
+    return _oid_under(node, LINUX_SYS_OBJECT_ID) or any(k in _node_text(node) for k in LINUX_KEYWORDS)
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_URL_IN_QUERY = re.compile(r"url:([^\"',}\s)]+)")
+
+
+def norm_url(value: str) -> str:
+    """scheme://host[:port]/path, lowercase host, default port and trailing slash dropped."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = "http://" + value
+    try:
+        u = urlsplit(value)
+        port = u.port
+    except ValueError:
+        return value.lower().rstrip("/")
+    scheme = (u.scheme or "http").lower()
+    host = (u.hostname or "").lower()
+    port_part = f":{port}" if port and port != _DEFAULT_PORTS.get(scheme) else ""
+    return f"{scheme}://{host}{port_part}{u.path.rstrip('/')}"
+
+
+def url_host(value: str) -> str:
+    try:
+        return (urlsplit(value if "://" in value else "http://" + value).hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 def _tokens(value: str) -> set[str]:
@@ -77,6 +119,58 @@ class Index:
             self.tag_keys[k.lower()].add(v.lower())
         self.dash_titles = [(d["title"].lower(), d) for d in dd.get("dashboards", [])]
         self.services = {s["name"].lower(): s for s in dd.get("services", []) if s.get("name")}
+        # HTTP checks: Synthetic tests plus monitors on http_check metrics.
+        self.http_by_url, self.http_by_host, self.http_named = {}, {}, []
+        for t in dd.get("synthetics", []):
+            label = f"synthetic {t['type']} test {t['id']}: {t['name']}"
+            self._add_http(t.get("url"), t["name"], label)
+        # Process checks: process monitors and hosts running the Agent process check.
+        self.process_monitors, self.process_named = [], []
+        for m in dd.get("monitors", []):
+            q = m.get("query") or ""
+            if m.get("type") == "process alert" or "processes(" in q or "process.up" in q:
+                label = f"process monitor #{m['id']}: {m['name']}"
+                self.process_monitors.append((f"{m['name']} {q}".lower(), label))
+                self.process_named.append((_tokens(m["name"]), label))
+            if "http.can_connect" in q or "http.response_time" in q or "http.ssl" in q:
+                label = f"http_check monitor #{m['id']}: {m['name']}"
+                urls = _URL_IN_QUERY.findall(q) or [""]
+                for u in urls:
+                    self._add_http(u, m["name"], label)
+
+    def _add_http(self, url, name, label):
+        if url:
+            self.http_by_url.setdefault(norm_url(url), label)
+            self.http_by_host.setdefault(url_host(url), label)
+        self.http_named.append((_tokens(name), label))
+
+    def http_check_for(self, urls: list[str], name: str):
+        """Returns (match label, quality): exact URL, same hostname, or similar name."""
+        for u in urls:
+            if norm_url(u) in self.http_by_url:
+                return self.http_by_url[norm_url(u)], "exact URL"
+        for u in urls:
+            h = url_host(u)
+            if h and h in self.http_by_host:
+                return f"{self.http_by_host[h]} (same hostname)", "same hostname"
+        label = _best_by_name(name, self.http_named)
+        return (f"{label} (similar name)", "similar name") if label else (None, "")
+
+    def process_check_for(self, processes: list[str], name: str, host: dict | None):
+        """Returns (match label, quality): process name, host process check, or similar name."""
+        wanted = set()
+        for p in processes:
+            p = p.strip().lower()
+            if p:
+                wanted.add(p)
+                wanted.add(p.rsplit(".", 1)[0] if p.endswith((".exe", ".sh", ".bat")) else p)
+        for text, label in self.process_monitors:
+            if any(w in text for w in wanted if len(w) > 2):
+                return label, "process name"
+        if host and "process" in {a.lower() for a in host.get("apps", [])}:
+            return f"host:{host['name']} / process check", "host process check"
+        label = _best_by_name(name, self.process_named)
+        return (f"{label} (similar name)", "similar name") if label else (None, "")
 
     def host_for(self, node: dict):
         for key in (node.get("name"), node.get("dns"), node.get("sysname")):
@@ -206,11 +300,56 @@ def map_custom_properties(sw, ix):
     return out
 
 
+def _has_word(text: str, keyword: str) -> bool:
+    """Whole-word match, so 'custom' does not match 'Customer' and 'web' not 'webhook'."""
+    return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text.lower()) is not None
+
+
 def _integration_for(text: str):
-    t = text.lower()
     for keys, integ in SAM_INTEGRATIONS:
-        if any(k in t for k in keys):
+        if any(_has_word(text, k) for k in keys):
             return integ
+    return None
+
+
+_HTTP_NAME = re.compile(r"\bhttps?\b", re.I)
+_PROCESS_NAME = re.compile(r"\bprocess(es)?\b", re.I)
+
+
+def _best_by_name(name: str, candidates: list[tuple[set, str]]):
+    tk = _tokens(name)
+    if not tk:
+        return None
+    score, label = max(((len(tk & t) / len(tk | t), lbl) for t, lbl in candidates if t),
+                       default=(0, None), key=lambda x: x[0])
+    return label if score >= 0.8 else None
+
+
+def process_component_reason(c: dict) -> str | None:
+    """Why a SAM component is considered a process monitor, or None."""
+    if c.get("process"):
+        return "component process setting"
+    try:
+        if SAM_PROCESS_COMPONENT_TYPES and int(c.get("type")) in SAM_PROCESS_COMPONENT_TYPES:
+            return "component type"
+    except (TypeError, ValueError):
+        pass
+    if _PROCESS_NAME.search(c.get("name") or ""):
+        return "component name"
+    return None
+
+
+def http_component_reason(c: dict) -> str | None:
+    """Why a SAM component is considered an HTTP/HTTPS monitor, or None."""
+    if str(c.get("url") or "").lower().startswith(("http://", "https://")):
+        return "component URL"
+    try:
+        if SAM_HTTP_COMPONENT_TYPES and int(c.get("type")) in SAM_HTTP_COMPONENT_TYPES:
+            return "component type"
+    except (TypeError, ValueError):
+        pass
+    if _HTTP_NAME.search(c.get("name") or ""):
+        return "component name"
     return None
 
 
@@ -220,21 +359,58 @@ def map_applications(sw, ix):
     for a in sw.get("applications", []):
         text = f"{a.get('template')} {a.get('name')}"
         integ = _integration_for(text)
+        comps = a.get("components", [])
+        reasons = [r for r in (http_component_reason(c) for c in comps) if r]
+        detected_by = "template/application name" if integ == "http_check" else \
+            (reasons[0] if integ is None and reasons else None)
+        if detected_by:
+            urls = [c["url"] for c in comps
+                    if str(c.get("url") or "").lower().startswith(("http://", "https://"))]
+            match, quality = ix.http_check_for(urls, a["name"])
+            note = "HTTP(S) monitor; create a Synthetic HTTP test or http_check monitor. No host required."
+            if not urls:
+                note += " No URL was read from SolarWinds, so matching used the name only."
+            out.append(_item("applications", a["id"], f"{a.get('node_name')} / {a['name']}", "auto",
+                             "Synthetic HTTP test / http_check monitor", bool(match), match, note,
+                             node=a.get("node_name"), template=a.get("template"), urls=", ".join(urls),
+                             detected_by=detected_by, match_quality=quality,
+                             components=len(comps), component_names=", ".join(c["name"] for c in comps[:6])))
+            continue
+
+        proc_reasons = [r for r in (process_component_reason(c) for c in comps) if r]
+        proc_detected = "template/application name" if integ == "process" else \
+            (proc_reasons[0] if integ is None and proc_reasons else None)
+        if proc_detected:
+            names = [c["process"] for c in comps if c.get("process")]
+            host = ix.host_for(nodes.get(a.get("node_id")) or {"name": a.get("node_name")})
+            match, quality = ix.process_check_for(names, a["name"], host)
+            note = ("Process monitor; use the Agent process check (process.d / Live Processes) "
+                    "and a process monitor to alert.")
+            if not names:
+                note += " No process name was read from SolarWinds, so matching used the name only."
+            out.append(_item("applications", a["id"], f"{a.get('node_name')} / {a['name']}", "auto",
+                             "Process check / process monitor", bool(match), match, note,
+                             node=a.get("node_name"), template=a.get("template"),
+                             processes=", ".join(names), detected_by=proc_detected, match_quality=quality,
+                             components=len(comps), component_names=", ".join(c["name"] for c in comps[:6])))
+            continue
         if integ:
             m, t, note = "auto", integ, f"Enable the {integ} integration."
-        elif any(k in text.lower() for k in SAM_REVIEW_KEYWORDS):
+        elif any(_has_word(text, k) for k in SAM_REVIEW_KEYWORDS):
             m, t, note = "review", "Custom Agent check", "Script or custom template; rebuild as a custom check."
         else:
-            m, t, note = "unsupported", "—", "No Datadog equivalent identified."
+            m, t = "unsupported", "—"
+            note = (f"No Datadog equivalent identified for template '{a.get('template')}' "
+                    f"(components: {', '.join(c['name'] for c in comps[:4]) or 'none read'}).")
         host = ix.host_for(nodes.get(a.get("node_id")) or {"name": a.get("node_name")})
         match = None
         if host and integ:
             apps = {x.lower() for x in host.get("apps", [])}
             if integ in apps or integ.replace("_check", "") in apps:
                 match = f"host:{host['name']} / {integ}"
-        comps = a.get("components", [])
         out.append(_item("applications", a["id"], f"{a.get('node_name')} / {a['name']}", m, t,
-                         bool(match), match, note, node=a.get("node_name"), template=a.get("template"),
+                         bool(match), match, note, node=a.get("node_name"), template=a.get("template"), urls="", detected_by="",
+                         match_quality="host integration" if match else "",
                          components=len(comps), component_names=", ".join(c["name"] for c in comps[:6])))
     return out
 
@@ -284,14 +460,28 @@ def map_dependencies(sw, ix):
 
 
 def map_snmp_devices(sw, ix):
+    nodes = {n["id"]: n for n in sw.get("nodes", [])}
+    labels = {1: "v1", 2: "v2c", 3: "v3"}
     out = []
     for s in sw.get("snmp_devices", []):
+        node = {**s, **nodes.get(s["id"], {})}
+        version = labels.get(int(s.get("snmp_version") or 0))
+        windows, linux = is_windows_server(node), is_linux_server(node)
+        target = "NDM device"
+        if windows or linux:
+            m, target = "unsupported", "— (Agent host, see Nodes)"
+            note = f"{'Windows' if windows else 'Linux'} server; not mapped to NDM. Migrated as an Agent host."
+        elif not version:
+            m, note = "review", "SNMP version not recognized; confirm v1, v2c or v3."
+        elif not s.get("sys_object_id"):
+            m, note = "review", "No sysObjectID recorded; confirm an NDM profile exists."
+        else:
+            m, note = "auto", "Add to NDM with a matching profile."
         dev = ix.ndm_for(s)
-        m, note = ("auto", "Add to NDM with a matching profile.") if s.get("sys_object_id") else \
-                  ("review", "No sysObjectID recorded; confirm an NDM profile exists.")
         match = f"ndm:{dev['name'] or dev['ip']}" if dev else None
-        out.append(_item("snmp_devices", s["id"], s["name"], m, "NDM device", bool(match), match, note,
-                         ip=s.get("ip"), snmp_version=f"v{s.get('snmp_version')}" if s.get("snmp_version") else "",
+        out.append(_item("snmp_devices", s["id"], s["name"], m, target, bool(match), match, note,
+                         ip=s.get("ip"), snmp_version=version or str(s.get("snmp_version") or ""),
+                         server_os="Windows" if windows else "Linux" if linux else "",
                          vendor=s.get("vendor"), model=s.get("machine_type"), sys_object_id=s.get("sys_object_id")))
     return out
 

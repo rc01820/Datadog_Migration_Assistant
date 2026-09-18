@@ -50,8 +50,9 @@ repeatable scan:
   volumes, groups, custom properties, SAM applications, alerts, dependencies
   and SNMP devices.
 - **Reads** the current state of the target Datadog organization: hosts, host
-  tags, monitors, dashboards, Network Device Monitoring (NDM) devices and
-  interfaces, and Service Catalog definitions.
+  tags, monitors (including http_check monitors), Synthetic HTTP and browser
+  tests, dashboards, Network Device Monitoring (NDM) devices and interfaces,
+  and Service Catalog definitions.
 - **Maps** each SolarWinds object to its Datadog equivalent and classifies it
   as *automatic*, *needs review* or *unsupported*.
 - **Checks** whether an equivalent already exists in Datadog, marking each
@@ -79,6 +80,7 @@ deletes anything in SolarWinds or Datadog.
 | Separate detailed report for every mapped element | Reports page |
 | Progress since the previous scan, per category | Overview, scan history, reports |
 | Responsive Datadog-inspired dark interface | Everywhere; works down to phone width |
+| Sign-in with local accounts, sessions and API tokens | Login page, Account page |
 
 ---
 
@@ -106,7 +108,7 @@ progress bar on the Overview page shows the current stage.
 | Progress | Stage |
 |---|---|
 | 1–55% | Read the eight SolarWinds query groups (SNMP devices are derived from nodes) |
-| 58–88% | Read Datadog hosts, tags, monitors, dashboards, NDM devices, services |
+| 58–88% | Read Datadog hosts, tags, monitors, dashboards, NDM devices, services, synthetic tests |
 | 92% | Run the mapping engine and compare with the previous completed scan |
 | 100% | Store results and summary; scan marked `complete` |
 
@@ -191,7 +193,9 @@ docker compose ps
 curl -s http://localhost:8080/api/health     # {"status":"ok"}
 ```
 
-Open `http://<docker-host>:8080`, choose **SolarWinds Orion**, and follow
+Open `http://<docker-host>:8080`. The first visit asks you to create a sign-in
+account (or set `DMA_ADMIN_USER` / `DMA_ADMIN_PASSWORD` beforehand). Then
+choose **SolarWinds Orion** and follow
 [Using the application](#7-using-the-application).
 
 To try it without real systems, tick **Demo data** on both connection panels.
@@ -216,6 +220,10 @@ details for SolarWinds and Datadog are entered in the UI, not in `.env`.
 | `DMA_SECRET_KEY` | *(generated)* | Secret used to encrypt stored credentials. If unset, a random key is generated at `/data/.dma_secret` on first start. **Set it explicitly** so credentials remain readable after restoring the data volume on another host. |
 | `DMA_DB_PATH` | `/data/dma.sqlite3` | SQLite database location. The generated secret file is stored in the same directory. |
 | `DMA_LOG_LEVEL` | `INFO` | Python log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `DMA_ADMIN_USER` / `DMA_ADMIN_PASSWORD` | *(unset)* | Optional: create the first sign-in account on first start. If unset, the first visit shows a setup page instead. Only used while no account exists. |
+| `DMA_SESSION_HOURS` | `12` | How long a sign-in lasts before it expires. |
+| `DMA_SAM_HTTP_COMPONENT_TYPES` | *(unset)* | Optional comma-separated SAM component type IDs that are HTTP/HTTPS monitors in your Orion (for example `6,14`). Confirm the IDs first; see [Verifying HTTP(S) components in SWQL](#verifying-https-components-in-swql). |
+| `DMA_SAM_PROCESS_COMPONENT_TYPES` | *(unset)* | Same idea for SAM process-monitor component types. |
 | `HTTPS_PROXY` / `NO_PROXY` | *(unset)* | Optional outbound proxy; see [Outbound HTTP proxy](#186-outbound-http-proxy). |
 
 ### Changing the port
@@ -280,6 +288,7 @@ If you scope the Application key, grant read access to:
 | Dashboards | `dashboards_read` | Dashboard titles |
 | Network Device Monitoring | NDM read permission | NDM devices and interfaces |
 | Service Catalog | `apm_service_catalog_read` | Service definitions and `dependsOn` |
+| Synthetic Monitoring | `synthetics_read` | Synthetic HTTP and browser tests, matched to SAM HTTP(S) monitors |
 
 A missing permission does not fail the scan; the affected Datadog category is
 skipped and shown as a warning, and the matching SolarWinds objects will
@@ -289,13 +298,32 @@ appear as *pending*.
 
 ## 7. Using the application
 
-### 7.1 Start page
+### 7.1 Signing in
+
+The first time the application starts with no accounts, it shows a **setup
+page** asking for a username and password (at least 10 characters). After
+that, every visit begins at the **login page**.
+
+- Sessions last `DMA_SESSION_HOURS` (12 by default) and are stored server-side;
+  signing out revokes them immediately.
+- After 10 failed attempts for the same username and IP address within 15
+  minutes, further attempts are refused for the rest of that window.
+- The **Account** page (your username in the top bar) changes your password
+  and manages who else can sign in. Changing a password signs out every
+  session for that account.
+- There is no password reset link. If you are locked out, see
+  [Resetting an account](#resetting-an-account).
+
+All accounts have the same rights: anyone who can sign in can see and change
+every migration.
+
+### 7.2 Start page
 
 Lists the supported source platforms and all existing migrations. Each
 migration row shows its source, destination, time of the last scan and current
 readiness. Select **SolarWinds Orion** to create a new migration.
 
-### 7.2 Connect SolarWinds and Datadog
+### 7.3 Connect SolarWinds and Datadog
 
 | Field | Notes |
 |---|---|
@@ -319,7 +347,7 @@ Use **Test SolarWinds** and **Test Datadog** before saving:
 **Save and run first scan** stores the migration and immediately starts the
 first scan.
 
-### 7.3 Overview
+### 7.4 Overview
 
 The home page of a migration.
 
@@ -328,8 +356,8 @@ The home page of a migration.
   previous scan, and a readiness trend line across all completed scans.
 - **Counts** — total SolarWinds objects, already in Datadog, still to migrate,
   automatic mapping, needs review, unsupported.
-- **Datadog today** — counts of hosts, network devices, monitors and
-  dashboards seen in the latest scan.
+- **Datadog today** — counts of hosts, network devices, monitors, synthetic
+  tests and dashboards seen in the latest scan.
 - **Category rows** — one row per SolarWinds category showing:
   - the SolarWinds count and object type,
   - a colored bar with the automatic / needs review / unsupported split,
@@ -343,7 +371,7 @@ The home page of a migration.
 - **Open assessment report** — opens the overall report for the latest scan.
 - **Scan warnings** — categories that were skipped and why.
 
-### 7.4 Inventory pages
+### 7.5 Inventory pages
 
 One page per category, reachable from the sidebar. Each shows:
 
@@ -367,14 +395,14 @@ Status values:
 | Pending | In scope, but no equivalent found yet. |
 | Out of scope | The object is classified *unsupported*. |
 
-### 7.5 Mapping rules
+### 7.6 Mapping rules
 
 Shows the SolarWinds-to-Datadog mapping table and, for each category, the
 conditions that produce *automatic*, *needs review* and *unsupported*, and what
 counts as *migrated*. This page is generated from `app/mapping/rules.py`, the
 same file the mapping engine reads, so it always reflects actual behaviour.
 
-### 7.6 Reports
+### 7.7 Reports
 
 Choose any completed scan, then open or download:
 
@@ -384,7 +412,7 @@ Choose any completed scan, then open or download:
 
 See [Reports and exports](#13-reports-and-exports).
 
-### 7.7 Scan history
+### 7.8 Scan history
 
 - A table of readiness per category for every completed scan (shown once two
   or more scans exist).
@@ -393,14 +421,14 @@ See [Reports and exports](#13-reports-and-exports).
 - Failed scans show their error message.
 - Links to each scan's reports, and **Delete** for scans that are not running.
 
-### 7.8 Connections
+### 7.9 Connections
 
 Edit the migration name and both connections, or delete the migration.
 Password and key fields show *Saved. Leave blank to keep*: leave them empty to
 keep stored secrets, or type a new value to replace them. **Delete migration**
 removes the migration and all its scans permanently.
 
-### 7.9 Recommended workflow
+### 7.10 Recommended workflow
 
 1. Create the migration and run the first scan. This is your baseline.
 2. Read the overall assessment report and export the *needs review* items per
@@ -427,7 +455,7 @@ All queries are sent as `POST /SolarWinds/InformationService/v3/Json/Query`.
 | Volumes | `Orion.Volumes` | VolumeID, NodeID, Node.Caption, Caption, VolumeType, VolumeSize, VolumePercentUsed |
 | Groups | `Orion.Container`, `Orion.ContainerMembers`, `Orion.ContainerMemberDefinition` | ContainerID, Name, Description, Status; members (name, entity type, ID); definitions (a definition starting with `filter:` marks a dynamic group) |
 | Custom properties | `Orion.CustomProperty`, then `Orion.NodesCustomProperties`, `Orion.NPM.InterfacesCustomProperties`, `Orion.VolumesCustomProperties` | Table, Field, DataType, Description; value count, distinct value count, up to 8 most common values |
-| Applications | `Orion.APM.Application` joined to `Orion.APM.ApplicationTemplate`; `Orion.APM.Component` | ApplicationID, Name, NodeID, Node.Caption, template name; component ID, name, type |
+| Applications | `Orion.APM.Application` joined to `Orion.APM.ApplicationTemplate`; `Orion.APM.Component`; `Orion.APM.ComponentSetting` | ApplicationID, Name, NodeID, Node.Caption, template name; component ID, name, type; component settings `Url` (HTTP/HTTPS monitors) and `ProcessName` / `ProcessNameFilter` / `ProcessCommandLine` (process monitors) |
 | Alerts | `Orion.AlertConfigurations` | AlertID, Name, Description, Enabled, Severity, ObjectType, Frequency |
 | Dependencies | `Orion.Dependencies` | DependencyId, Name, ParentUri, ChildUri, AutoManaged. URIs are resolved to node or group names. |
 | SNMP devices | Derived from nodes | Nodes whose polling method is `SNMP` |
@@ -436,8 +464,12 @@ Notes:
 
 - Group member and definition queries are optional. If they fail, groups are
   still listed (member count 0, not dynamic).
-- Component queries are optional. If they fail, applications are still listed
-  without components.
+- Component and component-URL queries are optional. If they fail,
+  applications are still listed without components or URLs, and the failure
+  is shown as a **scan warning** (HTTP(S) monitors then fall back to name
+  matching).
+- `Key` is a reserved word in SWQL, so the settings query uses
+  `[Key] IN ('Url', 'ProcessName', …)`.
 - Custom property values are only read for field names made of letters,
   digits and underscores. See [Known limitations](#25-known-limitations-and-roadmap).
 - Custom property tables are recognized under both naming forms Orion uses
@@ -457,11 +489,16 @@ Notes:
 | NDM devices (ID, name, IP, vendor, model, status, tags) | `GET /api/v2/ndm/devices` | 500 per page |
 | NDM interfaces per device | `GET /api/v2/ndm/interfaces?device_id=…` | first 1,000 devices |
 | Service definitions (`dd-service`, `dependsOn`) | `GET /api/v2/services/definitions` | 100 per page |
+| Synthetic tests (ID, name, type, target URL, tags); API HTTP and browser tests only | `GET /api/v1/synthetics/tests` | 100 per page |
 
 HTTP 429 responses are retried up to five times, waiting for the number of
 seconds in `X-RateLimit-Reset` (between 1 and 60 seconds). The NDM and
 Service Catalog endpoints tolerate 404 (feature not enabled) and return an
 empty list.
+
+http_check monitors are not a separate call: they are recognized among the
+monitors by queries that use `http.can_connect`, `http.response_time` or
+`http.ssl.*`, and their target URLs are read from `url:` tags in the query.
 
 ### 8.3 What is not collected
 
@@ -531,7 +568,7 @@ Each object also carries:
 
 Rules are evaluated top to bottom; the first match wins. Linux servers are
 often polled by SNMP (net-snmp) in SolarWinds, but in Datadog they belong on
-the Agent, not in NDM. See [Linux server detection](#116-linux-server-detection).
+the Agent, not in NDM. See [Windows and Linux server detection](#116-windows-and-linux-server-detection).
 
 **Migrated when:** the node's Caption, DNS name or SysName matches a Datadog
 host name or alias, **or** its IP address or name matches an NDM device.
@@ -601,8 +638,12 @@ Details: table, data type, values, distinct values, sample values.
 ### 10.6 Applications (SAM) → Integration / Check
 
 The application's template name and application name are combined and
-checked against a keyword list. **The first matching keyword wins**, so order
-matters.
+checked against a keyword list. Keywords match **whole words only** (so
+`custom` does not match "Customer" and `web` does not match "webhook").
+**The first matching keyword wins**, so order matters. A match on
+`http_check` identifies an **HTTP or HTTPS monitor**, which follows its own
+rule (see
+[HTTP and HTTPS monitor templates](#http-and-https-monitor-templates) below).
 
 | Keywords | Datadog integration |
 |---|---|
@@ -634,15 +675,149 @@ matters.
 
 | Condition | Result | Suggested target |
 |---|---|---|
-| A keyword above matches | Automatic | The integration |
+| HTTP or HTTPS monitor (see detection below) | Automatic | Synthetic HTTP test or http_check monitor; no Datadog host required |
+| Process monitor (see [Process monitors](#process-monitors)) | Automatic | Agent process check (process.d / Live Processes) plus a process monitor |
+| Another keyword above matches | Automatic | The integration |
 | No match, but contains script, powershell, wmi, performance counter, custom, snmp, file, event log or odbc | Needs review | Custom Agent check |
 | No match at all | Unsupported | — |
 
-**Migrated when:** the application's node exists as a Datadog host and that
-host's integration list contains the integration name (or the name without a
-`_check` suffix).
+**Migrated when (non-HTTP templates):** the application's node exists as a
+Datadog host and that host's integration list contains the integration name
+(or the name without a `_check` suffix).
 
-Details: node, template, component count, first six component names.
+#### HTTP and HTTPS monitor templates
+
+**Detection.** An application is treated as an HTTP(S) monitor when:
+
+1. its template or application name contains the word HTTP, HTTPS, URL or
+   web, **or**
+2. its name matches no other known technology, and **any of its components**:
+   - has a `Url` setting starting with `http://` or `https://`,
+   - has "HTTP" or "HTTPS" as a word in its name, or
+   - has a component type listed in `DMA_SAM_HTTP_COMPONENT_TYPES`.
+
+This means custom applications such as "Customer Portal" or "Payments
+Gateway" that contain HTTPS Monitor components are detected, even though
+their names say nothing about HTTP. An application whose name matches another
+technology (for example "Microsoft IIS" with an HTTP component inside) keeps
+that technology's integration rule.
+
+The **Detected by** column on the Applications page and in the CSV
+(`detected_by`) shows which signal was used: `template/application name`,
+`component URL`, `component type` or `component name`.
+
+An HTTP(S) monitor watches a URL, not a server, so **it does not need to map to
+a node**. The node it is assigned to in SolarWinds is shown for reference only;
+it does not have to exist in Datadog.
+
+The monitored URLs are read from each component's `Url` setting. The monitor
+counts as **migrated** when Datadog has either:
+
+- a **Synthetic HTTP test** (API test) or a **browser test**, or
+- a **normal http_check monitor** (a monitor on `http.can_connect`,
+  `http.response_time` or `http.ssl.*`),
+
+that matches, checked in this order (the level that matched is recorded as the
+**Match quality** column, so you can tell an exact hit from a guess):
+
+1. **Same URL.** Compared after normalization: scheme and hostname
+   lowercased, default ports (80, 443) and trailing slashes dropped, query
+   strings ignored. `HTTPS://Portal.example.com:443/health/` equals
+   `https://portal.example.com/health`.
+2. **Same hostname.** Any test or monitor on the same host, even with a
+   different path. The match is labelled *(same hostname)* in the
+   "Found in Datadog" column so you can verify it.
+3. **Similar name.** When no URL matches (or SolarWinds returned no URL), a
+   test or monitor whose name shares at least 80% of its words with the SAM
+   application name. Labelled *(similar name)*.
+
+| Match quality | Meaning |
+|---|---|
+| `exact URL` | Same URL after normalization. The strongest result. |
+| `same hostname` | A test or monitor on that host, but a different path. Verify it. |
+| `similar name` | No URL available or no URL matched; names lined up. Verify it. |
+| *(blank)* | Nothing found: still to migrate. |
+
+Examples of what is found:
+
+| Datadog object | Shown as |
+|---|---|
+| Synthetic API test `abc-123-xyz` "Portal up" on `https://portal.example.com/health` | `synthetic http test abc-123-xyz: Portal up` |
+| Monitor 42 with query `"http.can_connect".over("instance:status","url:http://status.example.com/")…` | `http_check monitor #42: Status page` |
+
+Tip: an http_check monitor that only filters by `instance:` has no URL in its
+query and can only match by name. Include `url:<address>` in the monitor
+query, or name the monitor after the SAM application, to get an exact match.
+
+Details: node, template, URLs, detected by and match quality (HTTP(S)
+monitors), component count, first six component names. Unsupported applications list
+their template and first component names in the note, to make
+misclassification easy to spot.
+
+#### Process monitors
+
+SAM process monitors (Windows, Linux or Unix) map to the **Agent process
+check** (`process.d`, surfaced as Live Processes) with a **process monitor**
+for alerting. Unlike HTTP(S) monitors, these do run on a host.
+
+**Detection.** An application is treated as a process monitor when:
+
+1. its template or application name contains the word "process", **or**
+2. its name matches no other known technology, and any of its components:
+   - has a `ProcessName`, `ProcessNameFilter` or `ProcessCommandLine`
+     setting,
+   - has "process" or "processes" as a word in its name, or
+   - has a component type listed in `DMA_SAM_PROCESS_COMPONENT_TYPES`.
+
+HTTP(S) detection is checked first, so an application containing both an HTTP
+component and a process component follows the HTTP rule.
+
+**Migrated when**, in this order:
+
+| Match quality | What matched |
+|---|---|
+| `process name` | A Datadog process monitor (type `process alert`, or a query using `processes(…)` or `process.up`) whose name or query mentions the monitored process. A `.exe`, `.sh` or `.bat` suffix is ignored, so `w3wp.exe` matches `w3wp`. |
+| `host process check` | The application's node is a Datadog host that reports the `process` integration. |
+| `similar name` | A process monitor whose name shares at least 80% of its words with the SAM application name. Used when no process name was read. |
+| *(blank)* | Nothing found: still to migrate. |
+
+Details: node, template, processes, detected by, match quality, component
+count, component names.
+
+Verify what will be read with:
+
+```sql
+SELECT a.Name AS Application, c.Name AS Component, c.ComponentType,
+       s.[Key] AS SettingKey, s.Value
+FROM Orion.APM.Component c
+JOIN Orion.APM.Application a ON a.ApplicationID = c.ApplicationID
+JOIN Orion.APM.ComponentSetting s ON s.ComponentID = c.ComponentID
+WHERE s.[Key] IN ('Url', 'ProcessName', 'ProcessNameFilter', 'ProcessCommandLine')
+ORDER BY a.Name
+```
+
+#### Verifying HTTP(S) components in SWQL
+
+Run this in SWQL Studio to see what the assistant will read. Every HTTP(S)
+monitor component should appear with its URL:
+
+```sql
+SELECT a.Name AS Application, t.Name AS Template, c.ComponentID,
+       c.Name AS Component, c.ComponentType, s.Value AS Url
+FROM Orion.APM.Component c
+JOIN Orion.APM.Application a ON a.ApplicationID = c.ApplicationID
+LEFT JOIN Orion.APM.ApplicationTemplate t ON t.ApplicationTemplateID = a.ApplicationTemplateID
+JOIN Orion.APM.ComponentSetting s ON s.ComponentID = c.ComponentID
+WHERE s.[Key] = 'Url'
+ORDER BY a.Name
+```
+
+- If this returns your components, URL-based detection and matching will work.
+- If it returns nothing, check the setting key name for your SAM version with
+  `SELECT DISTINCT s.[Key] FROM Orion.APM.ComponentSetting s` and let the
+  maintainer know.
+- The `ComponentType` values shown are the IDs to put in
+  `DMA_SAM_HTTP_COMPONENT_TYPES` if you want type-based detection as well.
 
 ### 10.7 Alerts → Monitor
 
@@ -682,14 +857,27 @@ Details: parent, child.
 
 ### 10.9 SNMP devices → NDM Device
 
+The category lists every node polled by SNMP. **Only nodes that are not
+Windows or Linux servers are mapped to NDM.**
+
 | Condition | Result | Suggested target |
 |---|---|---|
-| sysObjectID recorded | Automatic | NDM device |
-| No sysObjectID | Needs review | NDM device (confirm a profile exists) |
+| Node is a Windows or Linux server | Unsupported | — (migrated as an Agent host; see Nodes) |
+| SNMP v1, v2c or v3, sysObjectID recorded, not a Windows or Linux server | Automatic | NDM device |
+| Not a Windows or Linux server, but no sysObjectID or no recognized SNMP version | Needs review | NDM device (confirm the version and a profile) |
+
+Rules are evaluated top to bottom; the first match wins. SolarWinds reports
+the SNMP version as 1, 2 or 3; these are shown as `v1`, `v2c` and `v3`.
+
+Windows and Linux servers stay visible in this category so nothing
+disappears from the inventory, but as *unsupported* they are excluded from its
+readiness score, and they are not counted as migrated even if someone added
+them to NDM. See [Windows and Linux server detection](#116-windows-and-linux-server-detection).
 
 **Migrated when:** an NDM device with the same IP address or name exists.
 
-Details: IP, SNMP version, vendor, model, sysObjectID.
+Details: IP, SNMP version, server OS (Windows, Linux or blank), vendor, model,
+sysObjectID.
 
 ---
 
@@ -749,13 +937,28 @@ Datadog makes status reliable:
 | Name tags after the custom property | `environment:prod`, `business_unit:payments` |
 | Keep host names or aliases consistent with Orion captions | `web01` |
 | Declare dependencies in the Service Catalog | `dependsOn: [core-sw-01]` |
+| Point Synthetic tests and http_check monitors at the same URL SAM uses | `https://portal.example.com/health` |
 
 The SolarWinds alert ID is the `source_id` column in the Alerts CSV.
 
-### 11.6 Linux server detection
+### 11.6 Windows and Linux server detection
 
-Used by the node and interface rules. A node is treated as a Linux server
-when **either**:
+SolarWinds has no "server operating system" field, so the engine infers it.
+
+**Windows server** (used by the SNMP device rule). A node is treated as a
+Windows server when **either**:
+
+- its sysObjectID is under the Microsoft Windows OID `1.3.6.1.4.1.311.1.1.3`
+  (for example `…311.1.1.3.1.2` for Windows Server, `…311.1.1.3.1.3` for a
+  domain controller), with or without a leading dot, **or**
+- its Vendor, MachineType or OS version (IOSVersion) contains `windows`
+  (ignoring case).
+
+Extend `WINDOWS_KEYWORDS` in `app/mapping/rules.py` if your Orion uses other
+naming.
+
+**Linux server** (used by the node, interface and SNMP device rules). A node
+is treated as a Linux server when **either**:
 
 - its sysObjectID is the net-snmp Linux agent OID `1.3.6.1.4.1.8072.3.2.10`
   (with or without a leading dot), **or**
@@ -768,8 +971,10 @@ A vendor of `net-snmp` on its own is **not** enough, because net-snmp also
 runs on Solaris, AIX and other systems (their sysObjectIDs differ, for example
 `1.3.6.1.4.1.8072.3.2.3`).
 
-The result appears as the **Linux server** column on the Nodes and Interfaces
-inventory pages and in the CSV exports (`linux_server`).
+The Linux result appears as the **Linux server** column on the Nodes and
+Interfaces inventory pages and in their CSV exports (`linux_server`). The SNMP
+devices page and CSV show a **Server OS** column (`server_os`) with `Windows`,
+`Linux` or blank.
 
 To recognize more distributions or naming used in your Orion, add keywords to
 `LINUX_KEYWORDS` in `app/mapping/rules.py`.
@@ -889,11 +1094,14 @@ Tick **Demo data** on the SolarWinds panel, the Datadog panel, or both.
 - The generated SolarWinds estate has about 600 objects: three sites with
   Windows and Linux servers (Agent, WMI, SNMP-polled Linux servers and one
   ICMP-only node), Cisco,
-  Juniper, Palo Alto and APC network devices, an external node, seven groups
+  Juniper, Palo Alto and APC network devices, an external node carrying
+  HTTP(S) monitors (plus HTTPS monitors on each site's web server), seven groups
   (including a dynamic and an empty one), eleven custom properties, SAM
   applications, sixteen alerts and a set of dependencies, including one
   orphaned dependency.
-- The generated Datadog organization contains a growing share of that estate.
+- The generated Datadog organization contains a growing share of that estate,
+  including Synthetic HTTP tests, http_check monitors and process monitors for
+  some of the HTTP(S) and process monitors.
   The share is `18% + 17% × (number of completed scans)`, capped at 96%, so
   every new scan shows progress.
 - The data is deterministic: the same scan number always produces the same
@@ -917,10 +1125,43 @@ All request and response bodies are JSON unless noted.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/health` | `{"status":"ok"}`; used by the container health check |
+| GET | `/api/health` | `{"status":"ok"}`; used by the container health check. No sign-in required. |
 | GET | `/api/meta` | Source tools, Datadog sites, category metadata, mapping rules |
 
-### 15.2 Migrations (projects)
+### 15.2 Authentication
+
+Every `/api/*` endpoint requires a session except `/api/health`,
+`/api/auth/status`, `/api/auth/login` and `/api/auth/setup`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/auth/status` | `{"authenticated": bool, "setup_required": bool, "username": …}` |
+| POST | `/api/auth/setup` | Create the first account; **409** once one exists |
+| POST | `/api/auth/login` | Sign in; sets cookies and returns an API token |
+| POST | `/api/auth/logout` | Revoke the current session |
+| POST | `/api/auth/password` | `{current_password, new_password}`; revokes all sessions |
+| GET | `/api/users` | List accounts |
+| POST | `/api/users` | Create an account |
+| DELETE | `/api/users/{id}` | Remove an account (not your own, not the last one) |
+
+Two ways to authenticate:
+
+- **Browser:** an HttpOnly session cookie. Non-GET requests must also send the
+  `X-CSRF-Token` header matching the `dma_csrf` cookie (the UI does this
+  automatically). Without it the request is refused with **403**.
+- **Scripts:** the `token` returned by `/api/auth/login`, sent as
+  `Authorization: Bearer <token>`. Bearer requests skip the CSRF check. The
+  token is a session and expires with it.
+
+```bash
+TOKEN=$(curl -sf -X POST http://localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"…"}' | jq -r .token)
+
+curl -sf -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/projects
+```
+
+### 15.3 Migrations (projects)
 
 | Method | Path | Description |
 |---|---|---|
@@ -959,7 +1200,7 @@ Masked response fragment:
 "source": { "host": "orion.corp.example.com", "password": "", "password_set": true }
 ```
 
-### 15.3 Connection tests
+### 15.4 Connection tests
 
 | Method | Path | Description |
 |---|---|---|
@@ -978,7 +1219,7 @@ Both endpoints return HTTP 200. Check `ok`:
 { "ok": false, "error": "SolarWinds rejected the credentials (HTTP 401)" }
 ```
 
-### 15.4 Scans
+### 15.5 Scans
 
 | Method | Path | Description |
 |---|---|---|
@@ -1004,7 +1245,7 @@ Response: `{"total": 252, "items": [ ... ]}`.
 
 Scan status values: `running`, `complete`, `failed`.
 
-### 15.5 Reports and exports
+### 15.6 Reports and exports
 
 | Method | Path | Returns |
 |---|---|---|
@@ -1015,7 +1256,7 @@ Scan status values: `running`, `complete`, `failed`.
 
 These return **409** if the scan is not complete.
 
-### 15.6 Scripting example
+### 15.7 Scripting example
 
 Run a scan every night and save the assessment report (requires `jq`):
 
@@ -1025,17 +1266,21 @@ set -euo pipefail
 BASE=http://localhost:8080
 PID=1
 
-SID=$(curl -sf -X POST "$BASE/api/projects/$PID/scans" | jq -r .id)
+TOKEN=$(curl -sf -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$DMA_USER\",\"password\":\"$DMA_PASS\"}" | jq -r .token)
+auth=(-H "Authorization: Bearer $TOKEN")
 
-while [ "$(curl -sf "$BASE/api/scans/$SID" | jq -r .status)" = "running" ]; do
+SID=$(curl -sf "${auth[@]}" -X POST "$BASE/api/projects/$PID/scans" | jq -r .id)
+
+while [ "$(curl -sf "${auth[@]}" "$BASE/api/scans/$SID" | jq -r .status)" = "running" ]; do
   sleep 15
 done
 
-STATUS=$(curl -sf "$BASE/api/scans/$SID" | jq -r .status)
+STATUS=$(curl -sf "${auth[@]}" "$BASE/api/scans/$SID" | jq -r .status)
 [ "$STATUS" = "complete" ] || { echo "scan $SID $STATUS"; exit 1; }
 
-curl -sf "$BASE/api/scans/$SID/report" -o "assessment-$(date +%F).html"
-curl -sf "$BASE/api/scans/$SID" | jq '.summary.overall | {readiness, migrated, pending}'
+curl -sf "${auth[@]}" "$BASE/api/scans/$SID/report" -o "assessment-$(date +%F).html"
+curl -sf "${auth[@]}" "$BASE/api/scans/$SID" | jq '.summary.overall | {readiness, migrated, pending}'
 ```
 
 Cron entry:
@@ -1062,6 +1307,24 @@ SQLite at `DMA_DB_PATH` (default `/data/dma.sqlite3`).
 | `source_config` | TEXT | Encrypted JSON (SolarWinds connection) |
 | `datadog_config` | TEXT | Encrypted JSON (Datadog connection) |
 | `created_at`, `updated_at` | TEXT | ISO 8601 UTC |
+
+**`users`**
+
+| Column | Type | Content |
+|---|---|---|
+| `id` | INTEGER | Primary key |
+| `username` | TEXT | Unique, case-insensitive on lookup |
+| `password_hash` | TEXT | `pbkdf2_sha256$<iterations>$<salt>$<hash>` |
+| `created_at`, `last_login` | TEXT | ISO 8601 UTC |
+
+**`sessions`**
+
+| Column | Type | Content |
+|---|---|---|
+| `id` | INTEGER | Primary key |
+| `user_id` | INTEGER | Owning account |
+| `token_hash` | TEXT | SHA-256 of the session token; the token itself is never stored |
+| `created_at`, `expires_at` | TEXT | ISO 8601 UTC |
 
 **`scans`**
 
@@ -1135,11 +1398,35 @@ EOF
 
 ### 17.2 Application access
 
-- **The application has no built-in login.** Anyone who can reach port 8080
-  can view results, run scans and edit or delete migrations.
-- Always run it on a trusted network, bound to localhost, or behind a reverse
-  proxy that enforces authentication (see
-  [Deployment guide](#18-deployment-guide)).
+- **Sign-in is required** for every API endpoint except the health check.
+  Passwords are stored as PBKDF2-HMAC-SHA256 with a random salt and 600,000
+  iterations, and compared in constant time.
+- Sessions live in the database; only a SHA-256 hash of the token is stored.
+  The session cookie is `HttpOnly` and `SameSite=Lax`, and is marked `Secure`
+  when the request arrives over HTTPS (including through a proxy that sets
+  `X-Forwarded-Proto`).
+- Writes from the browser require a double-submit CSRF token.
+- Sign-in attempts are throttled: 10 failures per username and IP address in
+  15 minutes.
+- All accounts are equal; there are no roles. Everyone who signs in can see
+  and change every migration and every credential-free connection setting.
+- Serve the app over HTTPS (see [Deployment guide](#18-deployment-guide)), so
+  session cookies and passwords are never sent in clear text.
+
+#### Resetting an account
+
+There is no password reset link. To recover access:
+
+```bash
+docker compose exec migration-assistant python - <<'PY'
+from app import auth, db
+db.init()
+user = auth.get_user("admin")            # existing account
+auth.set_password(user["id"], "a-new-long-password")
+# or, if every account is lost:
+# auth.create_user("admin2", "a-new-long-password")
+PY
+```
 
 ### 17.3 Least privilege
 
@@ -1170,10 +1457,10 @@ EOF
 1. Bind the app to the Docker network only, or to `127.0.0.1:8080`.
 2. Add a proxy host, for example `migration.example.com` → `http://<host>:8080`.
 3. Request a certificate and force SSL.
-4. Add an access list, or protect the host with your SSO forward-auth
-   (Authentik, Authelia, or Keycloak via oauth2-proxy).
+4. Optional: add an access list or SSO forward-auth (Authentik, Authelia, or
+   Keycloak via oauth2-proxy) in front of the built-in sign-in.
 
-### 18.2 Behind plain Nginx with basic authentication
+### 18.2 Behind plain Nginx
 
 ```nginx
 server {
@@ -1182,9 +1469,6 @@ server {
 
     ssl_certificate     /etc/ssl/certs/migration.crt;
     ssl_certificate_key /etc/ssl/private/migration.key;
-
-    auth_basic           "Migration Assistant";
-    auth_basic_user_file /etc/nginx/.htpasswd;
 
     location / {
         proxy_pass         http://127.0.0.1:8080;
@@ -1317,6 +1601,9 @@ docker compose exec migration-assistant python -c \
 
 | Message | Likely cause | Fix |
 |---|---|---|
+| Login page says *Too many failed attempts* | Throttling after 10 failures | Wait for the 15-minute window to pass, or restart the container to clear it |
+| *Invalid CSRF token* | Stale page after a restart or expired session | Reload the page and sign in again |
+| Locked out with no working account | Password lost | See [Resetting an account](#resetting-an-account) |
 | `Cannot reach <host> on the SWIS port` | Firewall, wrong host, or SWIS service stopped | Test `curl -k https://<host>:17774` from the Docker host; check the *SolarWinds Information Service V3* service on Orion |
 | `SolarWinds rejected the credentials (HTTP 401)` | Wrong password, or account cannot log in to the web console | Log in to the Orion web console with the same account |
 | `SWIS query timed out` | Very large estate or overloaded Orion database | Retry off-peak; see [Performance](#21-performance-and-limits) |
@@ -1336,7 +1623,14 @@ docker compose exec migration-assistant python -c \
 | Warning: `Datadog services skipped` | No Service Catalog permission | Add `apm_service_catalog_read` |
 | Scan status `failed`: `Interrupted by an application restart` | Container restarted during a scan | Run the scan again |
 | **Run new scan** returns *Scan N is still running* | A scan is in progress | Wait for it to finish; progress is on the Overview page |
-| A Linux server polled by SNMP is mapped to an NDM device | Orion does not report a Linux sysObjectID or recognizable vendor/machine type | Add the naming Orion uses to `LINUX_KEYWORDS`; see [Linux server detection](#116-linux-server-detection) |
+| A Windows server shows as *automatic* under SNMP devices | Orion does not report a Windows sysObjectID or "Windows" in vendor/machine type | Add the naming Orion uses to `WINDOWS_KEYWORDS` |
+| A Linux server polled by SNMP is mapped to an NDM device | Orion does not report a Linux sysObjectID or recognizable vendor/machine type | Add the naming Orion uses to `LINUX_KEYWORDS`; see [Windows and Linux server detection](#116-windows-and-linux-server-detection) |
+| A process monitor shows *pending* although a Datadog process monitor exists | The monitor's name and query do not mention the process name | Include the process name in the monitor query (`processes("java")…`) or its name |
+| HTTP(S) component monitors show as *unsupported* | Application name matches no technology and no URL was read, so components were not recognized | Check scan warnings for `SAM component URLs not read`; run the [verification query](#verifying-https-components-in-swql); optionally set `DMA_SAM_HTTP_COMPONENT_TYPES` |
+| Warning: `SAM component URLs not read` | The URL settings query failed | Run the [verification query](#verifying-https-components-in-swql) in SWQL Studio and compare the error |
+| An HTTP(S) monitor shows *pending* although a test exists | URL differs (host or path), or the monitor query filters only by `instance:` | Align the URL, add `url:` to the monitor query, or name the test after the SAM application |
+| An HTTP(S) monitor is *migrated* via "(same hostname)" but the path is not covered | Another test on that host matched | Add a test for the exact URL; the hostname fallback is a hint, not proof |
+| Warning: `Datadog synthetics skipped` | Application key lacks `synthetics_read` | Add the scope |
 | Everything shows *pending* although hosts exist in Datadog | Host names differ from Orion captions/DNS/SysName | Add Datadog host aliases, or adjust `norm_host` |
 | Alerts never match | Monitor names differ from alert names | Tag monitors with `sw_alert_id:<AlertID>` |
 | Custom property shows *unsupported* but has values | Property name contains spaces or symbols | See [Known limitations](#25-known-limitations-and-roadmap) |
@@ -1405,6 +1699,7 @@ pip install -r requirements.txt
 mkdir -p data
 export DMA_DB_PATH=./data/dma.sqlite3
 export DMA_SECRET_KEY=dev-only-secret
+export DMA_ADMIN_USER=dev DMA_ADMIN_PASSWORD=dev-password-123
 uvicorn app.main:app --reload --port 8080
 ```
 
@@ -1421,7 +1716,8 @@ Open `http://localhost:8080` and use demo data.
 
 | Route | View |
 |---|---|
-| `#/` | Start page |
+| `#/` | Login, or the start page when signed in |
+| `#/account` | Account: password and other accounts |
 | `#/new/solarwinds` | New migration |
 | `#/p/{id}` | Overview |
 | `#/p/{id}/inventory/{category}` | Inventory |
@@ -1519,7 +1815,8 @@ datadog-migration-assistant/
 ├── requirements.txt           fastapi, uvicorn, httpx, pydantic, cryptography
 ├── README.md
 └── app/
-    ├── main.py                API routes, scan worker, static hosting
+    ├── main.py                API routes, auth middleware, scan worker, static hosting
+    ├── auth.py                Accounts, password hashing, sessions, throttling
     ├── db.py                  SQLite helpers and schema
     ├── crypto.py              Credential encryption and masking
     ├── demo.py                Demo inventories
@@ -1543,29 +1840,38 @@ datadog-migration-assistant/
 ### Limitations in 1.0
 
 - **Single source platform.** Only SolarWinds Orion is implemented.
-- **No authentication.** Protect the app with a reverse proxy.
+- **Authentication is basic by design:** local accounts only, no roles, no
+  SSO or MFA. Put SSO in front of it with a reverse proxy if you need that.
 - **Custom property names with spaces or symbols** are listed, but their
   values are not read, so they are classified as unsupported.
 - **Alert translation is not assessed.** Matching uses IDs and names;
   thresholds, trigger conditions and actions are not compared.
 - **SAM mapping is keyword-based** on template and application names, not on
   component types.
-- **SNMP devices category and Linux servers.** SNMP-polled Linux servers are
-  still listed under SNMP devices with an NDM device target, while the Nodes
-  category maps them to an Agent host.
+- **Windows servers polled by SNMP** are excluded from NDM in the SNMP
+  devices category, but the Nodes rules still map them to an NDM device (only
+  SNMP-polled *Linux* servers are mapped to an Agent host there).
+- **HTTP(S) monitor matching** checks that a test or monitor exists for the
+  URL, not that its assertions, frequency or locations match SolarWinds. The
+  hostname fallback can mark a monitor migrated when only another path on the
+  same host is tested. Multistep API tests are not read. Use the **Match
+  quality** column to separate exact URL hits from weaker matches.
+- **Process monitor matching** looks for the process name in a Datadog process
+  monitor's name or query, or for the `process` integration on the host. It
+  does not compare thresholds, command-line arguments or user context.
 - **Short-name host matching** can produce false matches when the same short
   name exists in several domains.
 - **NDM interface lookups** stop after 1,000 devices per scan.
 - **Dependencies** are always *needs review* when resolvable.
 - **Overall readiness** weights categories by object count.
 - **No scheduling.** Use the API with cron (see
-  [Scripting example](#156-scripting-example)).
+  [Scripting example](#157-scripting-example)).
 - A container restart during a scan marks that scan as failed.
 
 ### Roadmap
 
 - Zabbix, Checkmk, New Relic, Nagios XI and PRTG connectors.
-- Built-in authentication (OIDC).
+- OIDC or SAML single sign-on, and roles (read-only versus editor).
 - Scheduled scans and email or Slack summaries.
 - Alert threshold extraction and suggested monitor definitions (Terraform or
   JSON).

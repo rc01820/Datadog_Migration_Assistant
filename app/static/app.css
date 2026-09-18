@@ -241,3 +241,20 @@ td.detail { min-width: 90px; }
 @media (min-width: 861px) { .menu-btn { display: none !important; } .sidebar[hidden] { display: none; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 .panel-head.spread { align-items: center; }
+
+/* ------------------------------------------------------------ auth screens */
+.user-chip { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.user-chip a { color: var(--muted); }
+.user-chip a:hover { color: var(--text); }
+.user-chip button { padding: 4px 10px; font-size: 13px; }
+.menu-btn { margin-left: 8px; }
+.auth-page { display: grid; place-items: center; min-height: calc(100vh - 140px); padding: 24px 16px; }
+.auth-card { width: 100%; max-width: 380px; padding: 30px 28px; display: grid; gap: 14px; }
+.auth-card h1 { font-size: 21px; }
+.auth-card p.muted { margin-top: -8px; font-size: 13px; }
+.auth-card button.primary { margin-top: 4px; justify-content: center; }
+.auth-mark { width: 40px; height: 20px; }
+.auth-mark circle { fill: var(--violet); }
+.auth-mark .ring { fill: none; stroke: var(--violet); stroke-width: 2.5; }
+.auth-mark path { stroke: var(--muted); stroke-width: 2; stroke-dasharray: 3 3; }
+.auth-card .test-result:empty { display: none; }
